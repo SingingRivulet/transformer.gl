@@ -1,5 +1,8 @@
 # transformer.gl
-使用opengl实现的transformer模型推理。implementation of the transformer,using OpenGL  
-项目还没做完，目前在llama2.c的fork上开发  
-https://github.com/cgoxopx/llama2.gl   
-当前版本已经可以完成运行了
+基于opengl计算着色器的transformer推理实现  
+本项目基于llama2.c(https://github.com/cgoxopx/llama2.gl)   
+使用方法：
+```
+make
+./run_gpu stories15M.bin
+```
