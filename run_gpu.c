@@ -115,6 +115,7 @@ typedef struct {
 
     int dim_vec4;
     int hidden_dim_vec4;
+    int vocab_size_vec4;
 } TransformerWeights_gpu;
 
 typedef struct {
@@ -176,7 +177,7 @@ static const char* shader_matmul_trans_vec4 =
     "void main(){\n"
     "    int i = int(gl_GlobalInvocationID.x);\n"
     "    vec4 val = vec4(0.0 , 0.0 , 0.0 , 0.0);\n"
-    "    for (int j = 0; j < n; j++) {\n"
+    "    for (int j = 0; j < d; j++) {\n"
     "        val += w.data[i  + j* n / 4 + w_offset / 4] * x.data[j + x_offset];\n"
     "    }\n"
     "    xout.data[i] = val;\n"
@@ -888,6 +889,7 @@ void compile_GPUProgram(GPUProgram* program) {
 void malloc_run_state(RunState* s, Config* p) {
     int dim_vec4 = ((p->dim / 4) + 1) * 4;
     int hidden_dim_vec4 = ((p->hidden_dim / 4) + 1) * 4;
+    int vocab_size_vec4 = ((p->vocab_size / 4) + 1) * 4;
 
     s->x_len = sizeof(float) * p->dim;
     create_GPU_buffer(s->x, s->x_len, GL_DYNAMIC_DRAW, NULL);
@@ -916,7 +918,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->att_len = sizeof(float) * p->n_heads * p->seq_len;
     create_GPU_buffer(s->att, s->att_len, GL_DYNAMIC_DRAW, NULL);
 
-    s->logits_len = sizeof(float) * p->vocab_size;
+    s->logits_len = sizeof(float) * vocab_size_vec4;
     create_GPU_buffer(s->logits, s->logits_len, GL_DYNAMIC_DRAW, NULL);
 
     s->probindex = (ProbIndex*)calloc(p->vocab_size, sizeof(ProbIndex));
@@ -978,6 +980,7 @@ void copyLocalMat(float* out, float* src, int n_layers, int dim_i, int dim_j, in
 void upload_weights(TransformerWeights_local* local, TransformerWeights_gpu* remote, Config* p) {
     remote->dim_vec4 = ((p->dim / 4) + 1) * 4;
     remote->hidden_dim_vec4 = ((p->hidden_dim / 4) + 1) * 4;
+    remote->vocab_size_vec4 = ((p->vocab_size / 4) + 1) * 4;
 
     remote->token_embedding_table = local->token_embedding_table;
 
@@ -1019,8 +1022,13 @@ void upload_weights(TransformerWeights_local* local, TransformerWeights_gpu* rem
 
     free(tmp);
 
+    tmp = (float*)malloc(sizeof(float) * p->n_layers * remote->dim_vec4 * p->hidden_dim);
+
+    copyLocalMat(tmp, local->w2, p->n_layers, p->hidden_dim, p->dim, remote->dim_vec4);
     remote->w2_len = sizeof(float) * p->n_layers * p->hidden_dim * p->dim;
-    create_GPU_buffer(remote->w2, remote->w2_len, GL_STATIC_DRAW, local->w2);
+    create_GPU_buffer(remote->w2, remote->w2_len, GL_STATIC_DRAW, tmp);
+
+    free(tmp);
 
     remote->rms_final_weight_len = sizeof(float) * p->dim;
     create_GPU_buffer(remote->rms_final_weight, remote->rms_final_weight_len, GL_STATIC_DRAW, local->rms_final_weight);
@@ -1033,8 +1041,13 @@ void upload_weights(TransformerWeights_local* local, TransformerWeights_gpu* rem
     remote->freq_cis_imag_len = sizeof(float) * p->seq_len * head_size / 2;
     create_GPU_buffer(remote->freq_cis_imag, remote->freq_cis_imag_len, GL_STATIC_DRAW, local->freq_cis_imag);
 
-    remote->wcls_len = sizeof(float) * p->dim * p->vocab_size;
-    create_GPU_buffer(remote->wcls, remote->wcls_len, GL_STATIC_DRAW, local->wcls);
+    tmp = (float*)malloc(sizeof(float) * remote->vocab_size_vec4 * p->dim);
+
+    copyLocalMat(tmp, local->wcls, 1, p->dim, p->vocab_size, remote->vocab_size_vec4);
+    remote->wcls_len = sizeof(float) * remote->vocab_size_vec4 * p->dim;
+    create_GPU_buffer(remote->wcls, remote->wcls_len, GL_STATIC_DRAW, tmp);
+
+    free(tmp);
 }
 
 // ----------------------------------------------------------------------------
@@ -1563,7 +1576,7 @@ void transformer(int token, int pos, Config* p, GPUProgram* prog, RunState* s, T
         GPU_CHECK();
 
         // final matmul to get the output of the ffn
-        matmul(prog, s, s->xb, s->hb, w->w2, hidden_dim, dim, 0, l * dim * hidden_dim);
+        matmul_trans_vec4(prog, s, s->xb, s->hb, w->w2, w->dim_vec4, hidden_dim, 0, l * w->dim_vec4 * hidden_dim);
 
         // residual connection
         accum(prog, s, x, s->xb, dim);
@@ -1573,7 +1586,7 @@ void transformer(int token, int pos, Config* p, GPUProgram* prog, RunState* s, T
     rmsnorm(prog, s, x, x, w->rms_final_weight, dim, 0);
 
     // classifier into logits
-    matmul(prog, s, s->logits, x, w->wcls, p->dim, p->vocab_size, 0, 0);
+    matmul_trans_vec4(prog, s, s->logits, x, w->wcls, w->vocab_size_vec4, p->dim, 0, 0);
 }
 
 // ----------------------------------------------------------------------------
