@@ -1,11 +1,11 @@
 /*
-Inference for Llama-2 Transformer model in pure C.
+Inference for Llama-2 Transformer model in pure C with OpenGL Compute Shader.
 
 Example compile: (see README for more details)
-$ gcc -O3 -o run run.c -lm
+$ gcc -O3 -o run_gpu run_gpu.c -lm -lGLESv2 -lEGL
 
 Then run with:
-$ ./run
+$ ./run_gpu
 */
 
 #include <EGL/egl.h>
@@ -27,7 +27,7 @@ $ ./run
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
-#define DEBUG
+//#define DEBUG
 
 void checkGPUError(int line) {
     GLenum err = glGetError();
