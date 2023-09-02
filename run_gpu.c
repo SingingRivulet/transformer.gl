@@ -105,10 +105,8 @@ typedef struct {
     GLuint rms_final_weight;  // (dim,)
     GLuint rms_final_weight_len;
     // freq_cis for RoPE relatively positional embeddings
-    GLuint freq_cis_real;  // (seq_len, head_size/2)
-    GLuint freq_cis_real_len;
-    GLuint freq_cis_imag;  // (seq_len, head_size/2)
-    GLuint freq_cis_imag_len;
+    GLuint freq_cis;  // (seq_len, head_size)
+    GLuint freq_cis_len;
     // (optional) classifier weights for the logits, on the last layer
     GLuint wcls;
     GLuint wcls_len;
@@ -127,33 +125,6 @@ typedef struct {
     EGLContext context;
     EGLDisplay display;
 } GPUContext;
-
-static const char* shader_matmul =
-    "#version 320 es\n"
-    "uniform int n;\n"
-    "uniform int x_offset;\n"
-    "uniform int w_offset;\n"
-    "layout(local_size_x = 1) in;\n"
-    "layout(binding = 0) readonly buffer Input0{\n"
-    "    float data[];\n"
-    "} x;\n"
-
-    "layout(binding = 1) readonly buffer Input1{\n"
-    "    float data[];\n"
-    "} w;\n"
-
-    "layout(binding = 2) writeonly buffer Output0{\n"
-    "    float data[];\n"
-    "} xout;\n"
-
-    "void main(){\n"
-    "    int i = int(gl_GlobalInvocationID.x);\n"
-    "    float val = 0.0;\n"
-    "    for (int j = 0; j < n; j++) {\n"
-    "        val += w.data[i * n + j + w_offset] * x.data[j + x_offset];\n"
-    "    }\n"
-    "    xout.data[i] = val;\n"
-    "}\n";
 
 static const char* shader_matmul_trans_vec4 =
     "#version 320 es\n"
@@ -434,11 +405,11 @@ static const char* shader_accum =
     "layout(local_size_x = 1) in;\n"
 
     "layout(binding = 0) buffer Input0{\n"
-    "    float data[];\n"
+    "    vec4 data[];\n"
     "} a;\n"
 
     "layout(binding = 1) readonly buffer Input1{\n"
-    "    float data[];\n"
+    "    vec4 data[];\n"
     "} b;\n"
 
     "void main(){\n"
@@ -457,34 +428,25 @@ static const char* shader_positionalEncoding =
     "layout(local_size_x = 1) in;\n"
 
     "layout(binding = 0) readonly buffer Input0{\n"
-    "    float data[];\n"
-    "} freq_cis_real;\n"
+    "    vec2 data[];\n"
+    "} freq_cis;\n"
 
-    "layout(binding = 1) readonly buffer Input1{\n"
-    "    float data[];\n"
-    "} freq_cis_imag;\n"
-
-    "layout(binding = 2) buffer Input2{\n"
-    "    float data[];\n"
+    "layout(binding = 1) buffer Input1{\n"
+    "    vec2 data[];\n"
     "} q;\n"
 
-    "layout(binding = 3) buffer Input3{\n"
-    "    float data[];\n"
+    "layout(binding = 2) buffer Input2{\n"
+    "    vec2 data[];\n"
     "} k;\n"
 
     "void main(){\n"
     "    int idx = int(gl_GlobalInvocationID.x);\n"
     "    int i = idx*2;\n"
-    "    float q0 = q.data[i];\n"
-    "    float q1 = q.data[i+1];\n"
-    "    float k0 = k.data[i];\n"
-    "    float k1 = k.data[i+1];\n"
-    "    float fcr = freq_cis_real.data[freq_cis_idx_delta+(i % head_size) / 2];\n"
-    "    float fci = freq_cis_imag.data[freq_cis_idx_delta+(i % head_size) / 2];\n"
-    "    q.data[i]   = q0 * fcr - q1 * fci;\n"
-    "    q.data[i+1] = q0 * fci + q1 * fcr;\n"
-    "    k.data[i]   = k0 * fcr - k1 * fci;\n"
-    "    k.data[i+1] = k0 * fci + k1 * fcr;\n"
+    "    vec2 qi = q.data[idx];\n"
+    "    vec2 ki = k.data[idx];\n"
+    "    vec2 fc = freq_cis.data[freq_cis_idx_delta+(i % head_size) / 2];\n"
+    "    q.data[idx] = vec2(qi.x * fc.x - qi.y * fc.y , qi.x * fc.y + qi.y * fc.x);\n"
+    "    k.data[idx] = vec2(ki.x * fc.x - ki.y * fc.y , ki.x * fc.y + ki.y * fc.x);\n"
     "}\n";
 
 static const char* shader_transformer_silu_and_mulW3 =
@@ -492,17 +454,17 @@ static const char* shader_transformer_silu_and_mulW3 =
     "layout(local_size_x = 1) in;\n"
 
     "layout(binding = 0) buffer Input0{\n"
-    "    float data[];\n"
+    "    vec4 data[];\n"
     "} hb;\n"
 
     "layout(binding = 1) readonly buffer Input1{\n"
-    "    float data[];\n"
+    "    vec4 data[];\n"
     "} hb2;\n"
 
     "void main(){\n"
     "    int idx = int(gl_GlobalInvocationID.x);\n"
-    "    float v = hb.data[idx];\n"
-    "    float res = v * (1.0 / (1.0 + exp(-v))) * hb2.data[idx];\n"
+    "    vec4 v = hb.data[idx];\n"
+    "    vec4 res = v * (vec4(1.,1.,1.,1.) / (vec4(1.,1.,1.,1.) + exp(-v))) * hb2.data[idx];\n"
     "    hb.data[idx] = res;\n"
     "}\n";
 
@@ -660,7 +622,6 @@ static const char* shader_copyBuffer =
     "}\n";
 
 typedef struct {
-    GLuint shader_matmul;
     GLuint shader_rmsnorm_squares_and_sum;
     GLuint shader_sum;
     GLuint shader_sum_vec4;
@@ -836,8 +797,6 @@ GLuint createComputeProgram(const char* pComputeSource) {
 }
 
 void compile_GPUProgram(GPUProgram* program) {
-    program->shader_matmul = createComputeProgram(shader_matmul);
-    GPU_CHECK();
     program->shader_rmsnorm_squares_and_sum = createComputeProgram(shader_rmsnorm_squares_and_sum);
     GPU_CHECK();
     program->shader_sum = createComputeProgram(shader_sum);
@@ -891,7 +850,7 @@ void malloc_run_state(RunState* s, Config* p) {
     int hidden_dim_vec4 = ((p->hidden_dim / 4) + 1) * 4;
     int vocab_size_vec4 = ((p->vocab_size / 4) + 1) * 4;
 
-    s->x_len = sizeof(float) * p->dim;
+    s->x_len = sizeof(float) * dim_vec4;
     create_GPU_buffer(s->x, s->x_len, GL_DYNAMIC_DRAW, NULL);
 
     s->xb_len = sizeof(float) * dim_vec4;
@@ -1035,11 +994,14 @@ void upload_weights(TransformerWeights_local* local, TransformerWeights_gpu* rem
 
     int head_size = p->dim / p->n_heads;
 
-    remote->freq_cis_real_len = sizeof(float) * p->seq_len * head_size / 2;
-    create_GPU_buffer(remote->freq_cis_real, remote->freq_cis_real_len, GL_STATIC_DRAW, local->freq_cis_real);
-
-    remote->freq_cis_imag_len = sizeof(float) * p->seq_len * head_size / 2;
-    create_GPU_buffer(remote->freq_cis_imag, remote->freq_cis_imag_len, GL_STATIC_DRAW, local->freq_cis_imag);
+    tmp = (float*)malloc(sizeof(float) * p->seq_len * head_size);
+    for (int i = 0; i < p->seq_len * head_size / 2; ++i) {
+        tmp[i * 2] = local->freq_cis_real[i];
+        tmp[i * 2 + 1] = local->freq_cis_imag[i];
+    }
+    remote->freq_cis_len = sizeof(float) * p->seq_len * head_size;
+    create_GPU_buffer(remote->freq_cis, remote->freq_cis_len, GL_STATIC_DRAW, tmp);
+    free(tmp);
 
     tmp = (float*)malloc(sizeof(float) * remote->vocab_size_vec4 * p->dim);
 
@@ -1095,13 +1057,11 @@ void free_gpu_weight(TransformerWeights_gpu* gpu) {
     glDeleteBuffers(1, &gpu->w2);
     glDeleteBuffers(1, &gpu->w3);
     glDeleteBuffers(1, &gpu->rms_final_weight);
-    glDeleteBuffers(1, &gpu->freq_cis_real);
-    glDeleteBuffers(1, &gpu->freq_cis_imag);
+    glDeleteBuffers(1, &gpu->freq_cis);
     glDeleteBuffers(1, &gpu->wcls);
 }
 
 void free_gpu_program(GPUProgram* prog) {
-    glDeleteProgram(prog->shader_matmul);
     glDeleteProgram(prog->shader_rmsnorm_squares_and_sum);
     glDeleteProgram(prog->shader_sum);
     glDeleteProgram(prog->shader_sum_vec4);
@@ -1222,7 +1182,7 @@ void accum(GPUProgram* prog, RunState* state, GLuint a, GLuint b, int size) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, b);
     glUseProgram(prog->shader_accum);
 
-    glDispatchCompute(size, 1, 1);
+    glDispatchCompute(size / 4, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     GPU_CHECK();
 }
@@ -1373,28 +1333,6 @@ void transformer_sum(GPUProgram* prog, RunState* state, GLuint outMat, GLuint in
         inMat, state->mulBuffer_1, state->mulBuffer_2, size_x, size_y, NULL, &res);
 }
 
-void matmul(GPUProgram* prog, RunState* state, GLuint xout, GLuint x, GLuint w, int n, int d, int x_offset, int w_offset) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, x);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, w);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, xout);
-    glUseProgram(prog->shader_matmul);
-
-    int n_gpu = glGetUniformLocation(prog->shader_matmul, "n");
-    glUniform1i(n_gpu, n);
-
-    int x_offset_gpu = glGetUniformLocation(prog->shader_matmul, "x_offset");
-    glUniform1i(x_offset_gpu, x_offset);
-
-    int w_offset_gpu = glGetUniformLocation(prog->shader_matmul, "w_offset");
-    glUniform1i(w_offset_gpu, w_offset);
-
-    glDispatchCompute(d, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    GPU_CHECK();
-}
-
 void matmul_trans_vec4(GPUProgram* prog, RunState* state, GLuint xout, GLuint x, GLuint w, int n, int d, int x_offset, int w_offset) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -1464,10 +1402,9 @@ void transformer(int token, int pos, Config* p, GPUProgram* prog, RunState* s, T
 
         // RoPE relative positional encoding: complex-valued rotate q and k by freq_cis in each head
 
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, w->freq_cis_real);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, w->freq_cis_imag);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, s->q);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, s->k);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, w->freq_cis);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, s->q);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, s->k);
         glUseProgram(prog->shader_positionalEncoding);
 
         uniformVar = glGetUniformLocation(prog->shader_positionalEncoding, "pos");
@@ -1556,7 +1493,7 @@ void transformer(int token, int pos, Config* p, GPUProgram* prog, RunState* s, T
         matmul_trans_vec4(prog, s, s->xb2, s->xb, w->wo, w->dim_vec4, dim, 0, l * w->dim_vec4 * dim);
 
         // residual connection back into x
-        accum(prog, s, x, s->xb2, dim);
+        accum(prog, s, x, s->xb2, w->dim_vec4);
 
         // ffn rmsnorm
         rmsnorm(prog, s, s->xb, x, w->rms_ffn_weight, dim, l * dim);
@@ -1571,7 +1508,7 @@ void transformer(int token, int pos, Config* p, GPUProgram* prog, RunState* s, T
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, s->hb);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, s->hb2);
         glUseProgram(prog->shader_transformer_silu_and_mulW3);
-        glDispatchCompute(hidden_dim, 1, 1);
+        glDispatchCompute(w->hidden_dim_vec4 / 4, 1, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         GPU_CHECK();
 
@@ -1579,7 +1516,7 @@ void transformer(int token, int pos, Config* p, GPUProgram* prog, RunState* s, T
         matmul_trans_vec4(prog, s, s->xb, s->hb, w->w2, w->dim_vec4, hidden_dim, 0, l * w->dim_vec4 * hidden_dim);
 
         // residual connection
-        accum(prog, s, x, s->xb, dim);
+        accum(prog, s, x, s->xb, w->dim_vec4);
     }
 
     // final rmsnorm
